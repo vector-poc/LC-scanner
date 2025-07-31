@@ -7,14 +7,17 @@ with sample data or real LC extraction results.
 """
 
 import json
-import sys
+import os
 from pathlib import Path
 from typing import Dict, Any
+from dotenv import load_dotenv
 
-# Add current directory to path for package imports
-sys.path.insert(0, str(Path(__file__).parent))
+# Load environment variables
+load_dotenv()
 
-from lc_classifier.graph import run_classification
+from lc_classifier import run_classification
+from langfuse.langchain import CallbackHandler
+from langfuse import Langfuse
 
 
 def load_sample_lc_data() -> Dict[str, Any]:
@@ -134,61 +137,70 @@ def create_sample_documents():
 
 def main():
     """Main test function."""
-    print("🧪 Testing LC Document Classification Graph")
-    print("=" * 50)
+    print("Testing LC Document Classification Graph with Langfuse Tracing")
+    print("=" * 60)
+    
+    # Initialize Langfuse client  
+    try:
+        from langfuse import Langfuse
+        langfuse = Langfuse()
+        langfuse_handler = CallbackHandler()
+        langfuse_enabled = True
+        print("✅ Langfuse tracing enabled")
+    except Exception as e:
+        print(f"⚠️  Langfuse not available: {e}")
+        langfuse_enabled = False
     
     # Load test data
-    print("📥 Loading test data...")
     lc_data = load_sample_lc_data()
     input_documents = create_sample_documents()
     
-    print(f"✅ Loaded LC with {len(lc_data.get('DOCUMENTS_REQUIRED', []))} requirements")
-    print(f"✅ Created {len(input_documents)} sample documents")
+    print(f"Loaded LC with {len(lc_data.get('DOCUMENTS_REQUIRED', []))} requirements")
+    print(f"Created {len(input_documents)} sample documents")
     
     # Run classification
-    print("\n🚀 Running document classification...")
+    print("\nRunning document classification...")
     try:
+        if langfuse_enabled:
+            # Create a trace for this test run using the client method
+            trace_id = langfuse.create_trace_id()  
+            
         results = run_classification(lc_data, input_documents)
         
-        print("\n📊 CLASSIFICATION RESULTS")
+        print("\nCLASSIFICATION RESULTS")
         print("=" * 30)
         
-        print(f"Processing Status: {'✅ Complete' if results['processing_complete'] else '❌ Incomplete'}")
-        print(f"Total Requirements: {results['total_requirements']}")
-        print(f"Total Documents: {results['total_documents']}")
+        print(f"Status: {'Complete' if results['processing_complete'] else 'Incomplete'}")
+        print(f"Requirements: {results['total_requirements']}")
+        print(f"Documents: {results['total_documents']}")
         
         if results['errors']:
-            print(f"\n❌ Errors ({len(results['errors'])}):")
-            for error in results['errors']:
-                print(f"   - {error}")
+            print(f"\nErrors: {results['errors']}")
         
-        print(f"\n📋 DOCUMENT ASSIGNMENTS:")
+        print(f"\nDOCUMENT ASSIGNMENTS:")
         for req_name, matched_docs in results['final_assignments'].items():
             if matched_docs:
-                print(f"✅ {req_name}:")
-                for doc in matched_docs:
-                    print(f"   └─ {doc}")
+                print(f"✓ {req_name}: {', '.join(matched_docs)}")
             else:
-                print(f"❌ {req_name}: No matches")
+                print(f"✗ {req_name}: No matches")
         
-        print(f"\n🔍 DETAILED RESULTS:")
+        print(f"\nDETAILED RESULTS:")
         for i, result in enumerate(results['classification_results'], 1):
             print(f"\n{i}. {result.get('lc_requirement_name', 'Unknown')}")
             print(f"   Status: {result.get('status', 'unknown')}")
-            print(f"   Matches: {len(result.get('matched_documents', []))}")
             if result.get('matched_documents'):
                 for j, doc in enumerate(result['matched_documents']):
                     conf = result.get('confidence_scores', [0])[j] if j < len(result.get('confidence_scores', [])) else 0
-                    print(f"     • {doc} (confidence: {conf:.2f})")
-            print(f"   Reasoning: {result.get('reasoning', 'No reasoning provided')[:100]}...")
+                    print(f"   - {doc} (confidence: {conf:.2f})")
+            print(f"   Reasoning: {result.get('reasoning', 'No reasoning provided')[:150]}...")
         
-        print(f"\n🎉 Classification completed successfully!")
+        print(f"\nClassification completed successfully!")
+        if langfuse_enabled:
+            print(f"\n🔍 Check traces in Langfuse dashboard: https://cloud.langfuse.com/project")
         
     except Exception as e:
-        print(f"❌ Error during classification: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        print(f"Error during classification: {str(e)}")
+        raise
 
 
 if __name__ == "__main__":

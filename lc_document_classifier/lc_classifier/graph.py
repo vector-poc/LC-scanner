@@ -14,10 +14,12 @@ from .nodes import (
 )
 
 
-def create_document_classification_graph():
-    """Create and compile the document classification graph."""
+def create_document_classification_graph(use_memory=True):
+    """Create and compile the document classification graph.
     
-    # Create the state graph
+    Args:
+        use_memory: Whether to use MemorySaver for persistence (disable for Studio)
+    """
     workflow = StateGraph(DocumentClassificationState)
     
     # Add nodes
@@ -45,35 +47,34 @@ def create_document_classification_graph():
     
     workflow.add_edge("format_results", END)
     
-    # Add memory for persistence (useful for Studio debugging)
-    memory = MemorySaver()
-    
-    # Compile the graph
-    graph = workflow.compile(checkpointer=memory)
-    
-    return graph
+    # Compile with or without memory based on context
+    if use_memory:
+        memory = MemorySaver()
+        return workflow.compile(checkpointer=memory)
+    else:
+        return workflow.compile()
 
 
-# Create the main graph instance for LangGraph Studio
-graph = create_document_classification_graph()
+# Create graph instances
+graph_with_memory = create_document_classification_graph(use_memory=True)
+graph = create_document_classification_graph(use_memory=False)  # For Studio compatibility
 
 
 def run_classification(extracted_lc, input_documents, config=None):
-    """
-    Convenience function to run document classification.
+    """Run document classification with the graph.
     
     Args:
-        extracted_lc: LC analysis dictionary from existing extraction service
+        extracted_lc: LC analysis dictionary
         input_documents: List of documents with name, summary, full_text
         config: Optional configuration for graph execution
-        
+    
     Returns:
         Classification results
     """
     if config is None:
         config = {
             "configurable": {"thread_id": "default"},
-            "recursion_limit": 50  # Allow more steps for complex LC processing
+            "recursion_limit": 50
         }
     
     initial_state = {
@@ -88,7 +89,7 @@ def run_classification(extracted_lc, input_documents, config=None):
         "errors": []
     }
     
-    result = graph.invoke(initial_state, config=config)
+    result = graph_with_memory.invoke(initial_state, config=config)
     
     return {
         "final_assignments": result.get("final_assignments", {}),
