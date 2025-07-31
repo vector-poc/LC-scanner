@@ -7,6 +7,7 @@ from .base import BaseDocumentSchema
 class DocumentRequirement(BaseModel):
     """A specific document required for LC compliance."""
     name: str = Field(description="The exact name/type of the document as stated in the LC")
+    document_id: Optional[str] = Field(default=None, description="Unique identifier for the document requirement (e.g., 'doc_001', 'doc_002')")
     description: Optional[str] = Field(default=None, description="Detailed requirements, conditions, and specifications for this document")
     quantity: int = Field(default=1, description="Number of copies required, default is 1 if not specified")
     validation_criteria: Optional[List[str]] = Field(default=None, description="List of specific validation criteria that must be met for this document to be considered valid")
@@ -155,6 +156,7 @@ For documents, separate each distinct document type into its own object with pre
   "DOCUMENTS_REQUIRED": [
     {
       "name": "Commercial Invoice",
+      "document_id": "doc_001",
       "description": "Signed in duplicate stating goods, quantity, unit price, total amount, etc.",
       "quantity": 2,
       "validation_criteria": [
@@ -166,6 +168,7 @@ For documents, separate each distinct document type into its own object with pre
     },
     {
       "name": "Bill of Lading",
+      "document_id": "doc_002",
       "description": "Full set of clean on-board marine bills of lading marked freight prepaid, made out to order of issuing bank, showing applicant as notify party. Short form not acceptable.",
       "quantity": 2,
       "validation_criteria": [
