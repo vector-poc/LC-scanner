@@ -3,8 +3,7 @@
     "."
   ],
   "graphs": {
-    "document_classifier": "./graph_wrapper.py:graph"
+    "lc_classifier": "./graph.py:graph"
   },
-  "env": ".env",
-  "python_version": "3.11"
+  "env": ".env"
 }
