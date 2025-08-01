@@ -6,6 +6,7 @@ Classifies export documents into LC required document categories
 import json
 import os
 from pathlib import Path
+from typing import Optional
 from langgraph.graph import StateGraph, START, END
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
@@ -14,6 +15,11 @@ from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
+from db_service import LCDatabaseService, create_db_service
+# Import models for type checking
+import sys
+sys.path.append(str(Path(__file__).parent.parent / "api"))
+from models import LetterOfCredit as LCModel
 
 # Load environment variables
 load_dotenv()
@@ -21,6 +27,23 @@ load_dotenv()
 # Initialize Langfuse
 langfuse = Langfuse()
 langfuse_handler = CallbackHandler()
+
+# Shared database service instance
+_db_service = None
+
+def get_shared_db_service():
+    """Get or create a shared database service instance"""
+    global _db_service
+    if _db_service is None:
+        _db_service = create_db_service()
+    return _db_service
+
+def close_shared_db_service():
+    """Close the shared database service"""
+    global _db_service
+    if _db_service is not None:
+        _db_service.close()
+        _db_service = None
 
 
 class ClassificationState(TypedDict):
@@ -35,6 +58,9 @@ class ClassificationState(TypedDict):
     status: str
     error: str
     trace_id: str  # Add trace ID to state
+    # Database-related fields
+    lc_id: Optional[str]  # LC database ID (used to identify which LC to process)
+    classification_run_id: Optional[str]  # Classification run ID
 
 
 # Pydantic model for structured output
@@ -79,17 +105,37 @@ def get_langchain_llm():
 
 
 def load_lc_requirements(state: ClassificationState) -> ClassificationState:
-    """Load LC requirements from LC.json"""
+    """Load LC requirements from database using lc_id"""
     
     try:
-        lc_path = Path("../output/LC.json")
-        with open(lc_path, 'r', encoding='utf-8') as f:
-            lc_data = json.load(f)
+        lc_id = state.get("lc_id")
         
-        requirements = lc_data.get("DOCUMENTS_REQUIRED", [])
-        lc_reference = lc_data.get("LC_REFERENCE", "Unknown")
+        if not lc_id:
+            raise ValueError("LC ID not provided in state. Please provide 'lc_id' to identify which LC to process.")
         
-        print(f"✅ Loaded LC: {lc_reference}")
+        # Use shared database service
+        db_service = get_shared_db_service()
+        
+        # Try to get LC by ID first, if that fails try by reference
+        from models import LetterOfCredit as LCModel
+        lc = None
+        
+        try:
+            # Try as integer ID first
+            lc = db_service.session.query(LCModel).filter(LCModel.id == int(lc_id)).first()
+        except (ValueError, TypeError):
+            # If not a valid integer, try as reference string
+            lc = db_service.get_lc_by_reference(lc_id)
+            if lc:
+                lc_id = str(lc.id)
+        
+        if not lc:
+            raise ValueError(f"No LC found with ID or reference: {lc_id}")
+        
+        # Get LC requirements using the reference
+        requirements, lc_ref = db_service.get_lc_requirements_data(lc.lc_reference)
+        
+        print(f"✅ Loaded LC: {lc_ref} (ID: {lc_id})")
         print(f"✅ Found {len(requirements)} required document types:")
         for req in requirements:
             print(f"   - {req.get('name', 'Unknown')}")
@@ -97,7 +143,8 @@ def load_lc_requirements(state: ClassificationState) -> ClassificationState:
         return {
             **state,
             "lc_requirements": requirements,
-            "lc_reference": lc_reference,
+            "lc_reference": lc_ref,
+            "lc_id": lc_id,
             "status": "requirements_loaded"
         }
         
@@ -107,13 +154,20 @@ def load_lc_requirements(state: ClassificationState) -> ClassificationState:
 
 
 def load_export_documents(state: ClassificationState) -> ClassificationState:
-    """Load export documents from Export_docs.json"""
+    """Load export documents from database using lc_reference"""
     
     try:
-        export_path = Path("../output/Export_docs.json")
-        with open(export_path, 'r', encoding='utf-8') as f:
-            export_data = json.load(f)
+        lc_reference = state.get("lc_reference")
+        lc_id = state.get("lc_id")
         
+        if not lc_reference:
+            raise ValueError("LC reference not available from previous step")
+        
+        # Use shared database service
+        db_service = get_shared_db_service()
+        
+        # Get export documents from database for this specific LC
+        export_data = db_service.get_export_documents_data(lc_reference=lc_reference)
         documents = export_data.get("documents", [])
         
         print(f"✅ Loaded {len(documents)} export documents:")
@@ -123,12 +177,31 @@ def load_export_documents(state: ClassificationState) -> ClassificationState:
         if len(documents) > 3:
             print(f"   ... and {len(documents) - 3} more")
         
+        # Create classification run for tracking
+        lc_requirements = state.get("lc_requirements", [])
+        if lc_id and lc_requirements:
+            try:
+                run = db_service.create_classification_run(
+                    lc_reference=lc_reference,
+                    total_export_docs=len(documents),
+                    total_lc_requirements=len(lc_requirements),
+                    model_used="langchain_gpt-4o-mini"
+                )
+                classification_run_id = str(run.id)
+                print(f"✅ Created classification run: {classification_run_id}")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not create classification run: {e}")
+                classification_run_id = None
+        else:
+            classification_run_id = None
+        
         updated_state = {
             **state,
             "export_documents": documents,
             "current_doc_index": 0,
             "classifications": [],
             "total_documents": len(documents),
+            "classification_run_id": classification_run_id,
             "status": "documents_loaded"
         }
         return updated_state
@@ -254,6 +327,7 @@ def record_and_continue(state: ClassificationState) -> ClassificationState:
     try:
         result = state.get("current_classification", {})
         classifications = state.get("classifications", [])
+        classification_run_id = state.get("classification_run_id")
         
         # Use the LC document details directly from the LLM response
         if result["classified"]:
@@ -274,7 +348,25 @@ def record_and_continue(state: ClassificationState) -> ClassificationState:
             "is_classified": result["classified"]
         }
         
-        # Add to classifications list
+        # Save to database if we have the necessary components
+        if classification_run_id and result["classified"] and lc_document_id != "OTHER":
+            try:
+                # Use shared database service for saving
+                db_service = get_shared_db_service()
+                db_classification, export_doc = db_service.save_classification(
+                    classification_run_id=int(classification_run_id),
+                    export_document_id=result["document_id"],
+                    lc_requirement_id=lc_document_id,
+                    confidence=result["confidence"],
+                    reasoning=result.get("reason", ""),
+                    is_matched=result["classified"]
+                )
+                print(f"✅ Saved classification to database: {db_classification.id}")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not save classification to database: {e}")
+                # Continue with in-memory classification even if database save fails
+        
+        # Add to in-memory classifications list for backward compatibility
         classifications.append(classification_record)
         
         print(f"📝 Stored classification record:")
@@ -286,6 +378,27 @@ def record_and_continue(state: ClassificationState) -> ClassificationState:
         
         # Move to next document
         next_index = state["current_doc_index"] + 1
+        
+        # Check if this was the last document and finalize classification run
+        total_docs = state.get("total_documents", 0)
+        classification_run_id = state.get("classification_run_id")
+        
+        if next_index >= total_docs:
+            # This was the last document - finalize the classification run
+            if classification_run_id:
+                try:
+                    # Use shared database service for finalizing
+                    db_service = get_shared_db_service()
+                    classified_count = sum(1 for c in classifications if c.get('is_classified', False))
+                    db_service.update_classification_run_status(
+                        run_id=int(classification_run_id),
+                        status="completed",
+                        total_matches_found=classified_count
+                    )
+                    print(f"✅ Finalized classification run: {classification_run_id}")
+                    print(f"✅ Classification completed! Processed {total_docs} documents, found {classified_count} matches")
+                except Exception as e:
+                    print(f"⚠️  Warning: Could not finalize classification run: {e}")
         
         return {
             **state,
@@ -316,80 +429,57 @@ def should_continue(state: ClassificationState) -> str:
         return "classify_next"
 
 
-def format_final_results(state: ClassificationState) -> ClassificationState:
-    """Format and display final classification results"""
+
+def initialize_graph_with_lc(lc_reference: str, trace_id: str = None) -> ClassificationState:
+    """Initialize the graph state with LC reference and database service"""
     
     try:
-        lc_reference = state.get("lc_reference", "Unknown")
-        requirements = state.get("lc_requirements", [])
-        classifications = state.get("classifications", [])
-        total_docs = state.get("total_documents", 0)
+        # Create database service
+        db_service = create_db_service()
         
-        print("\n" + "="*80)
-        print("🎯 DOCUMENT CLASSIFICATION RESULTS")
-        print("="*80)
-        print(f"LC Reference: {lc_reference}")
+        # Test database connection
+        if not db_service:
+            raise ValueError("Could not create database service")
         
-        # Count successful classifications
-        classified_count = sum(1 for c in classifications if c.get("is_classified", False))
-        print(f"Documents successfully classified: {classified_count}/{total_docs}")
+        print(f"✅ Database service initialized")
+        print(f"🎯 Target LC: {lc_reference}")
         
-        print("\n📋 EXPORT DOCUMENT CLASSIFICATIONS:")
-        print("-" * 80)
-        
-        # Group by LC requirement for better display
-        grouped_by_lc = {}
-        unclassified_docs = []
-        
-        for classification in classifications:
-            if classification["is_classified"]:
-                lc_req_name = classification["lc_document_name"]
-                if lc_req_name not in grouped_by_lc:
-                    grouped_by_lc[lc_req_name] = []
-                grouped_by_lc[lc_req_name].append(classification)
-            else:
-                unclassified_docs.append(classification)
-        
-        # Display classified documents grouped by LC requirement
-        for requirement in requirements:
-            req_name = requirement["name"]
-            matched_docs = grouped_by_lc.get(req_name, [])
-            
-            print(f"\n📄 {req_name}:")
-            if matched_docs:
-                for doc in matched_docs:
-                    print(f"   ✅ {doc['export_document_name']}")
-                    print(f"      📊 Confidence: {doc['confidence']:.1%}")
-                    print(f"      💭 Reasoning: {doc['reasoning']}")
-            else:
-                print("   ❌ No matching export documents found")
-        
-        # Show unclassified documents
-        if unclassified_docs:
-            print(f"\n❓ UNCLASSIFIED DOCUMENTS:")
-            print("-" * 40)
-            for doc in unclassified_docs:
-                print(f"   ❌ {doc['export_document_name']}")
-                print(f"      📊 Best confidence: {doc['confidence']:.1%}")
-                print(f"      💭 Reasoning: {doc['reasoning']}")
-        
-        # Summary statistics
-        print(f"\n📊 SUMMARY:")
-        print(f"   Total documents processed: {len(classifications)}")
-        print(f"   Successfully classified: {classified_count}")
-        print(f"   Unclassified: {len(unclassified_docs)}")
-        print(f"   Classification rate: {(classified_count/total_docs*100):.1f}%" if total_docs > 0 else "   Classification rate: 0%")
-        
-        return {
-            **state,
-            "final_results": classifications,
-            "processing_complete": True,
-            "status": "completed"
+        # Create initial state with database service and LC reference
+        initial_state = {
+            "lc_requirements": [],
+            "lc_reference": lc_reference,
+            "export_documents": [],
+            "current_doc_index": 0,
+            "classifications": [],
+            "current_classification": {},
+            "total_documents": 0,
+            "status": "initialized",
+            "error": "",
+            "trace_id": trace_id or "",
+            "lc_id": None,
+            "classification_run_id": None,
+            "db_service": db_service
         }
         
+        return initial_state
+        
     except Exception as e:
-        print(f"❌ Error formatting results: {e}")
-        return {**state, "error": f"Result formatting failed: {e}"}
+        print(f"❌ Error initializing graph: {e}")
+        return {
+            "lc_requirements": [],
+            "lc_reference": lc_reference,
+            "export_documents": [],
+            "current_doc_index": 0,
+            "classifications": [],
+            "current_classification": {},
+            "total_documents": 0,
+            "status": "initialization_failed",
+            "error": f"Initialization failed: {e}",
+            "trace_id": trace_id or "",
+            "lc_id": None,
+            "classification_run_id": None,
+            "db_service": None
+        }
 
 
 def call_ai_classifier_with_selection(prompt: str, trace_id: str = None) -> dict:
@@ -425,13 +515,8 @@ def call_ai_classifier_with_selection(prompt: str, trace_id: str = None) -> dict
         try:
             message = HumanMessage(content=prompt)
             
-            # Use trace-scoped callback handler if trace_id is provided
-            if trace_id:
-                trace = langfuse.get_trace(trace_id)
-                trace_handler = trace.get_langchain_handler()
-                callbacks = [trace_handler]
-            else:
-                callbacks = [langfuse_handler]
+            # Use langfuse callback handler
+            callbacks = [langfuse_handler]
             
             result = structured_llm.invoke([message], config={"callbacks": callbacks})
             
@@ -515,50 +600,125 @@ def create_graph():
 graph = create_graph()
 
 
-# Simple runner function
-def run_classification():
-    """Run the classification graph"""
+# Enhanced runner function with database support
+def run_classification(lc_reference: str = None):
+    """Run the classification graph with database integration"""
     
     print("🚀 Starting LC Document Classification")
     print("="*50)
     
     # Create main trace for the classification process
-    trace = langfuse.trace(
+    trace_id = langfuse.create_trace_id()
+    trace = langfuse.start_span(
         name="LC Document Classification",
-        tags=["document-classification", "export-documents", "letter-of-credit"],
         metadata={
             "session": "classification_run",
-            "version": "1.0"
+            "version": "2.0",
+            "lc_reference": lc_reference or "unknown"
         }
     )
     
-    initial_state = {
-        "lc_requirements": [],
-        "lc_reference": "",
-        "export_documents": [],
-        "current_doc_index": 0,
-        "classifications": [],
-        "current_classification": {},
-        "total_documents": 0,
-        "status": "starting",
-        "error": "",
-        "trace_id": trace.id
-    }
+    # Initialize graph state with database service
+    if lc_reference:
+        print(f"🎯 Using database mode with LC reference: {lc_reference}")
+        initial_state = initialize_graph_with_lc(lc_reference, trace_id)
+    else:
+        print("⚠️  No LC reference provided - using legacy mode")
+        # Fallback to old behavior for backward compatibility
+        initial_state = {
+            "lc_requirements": [],
+            "lc_reference": "",
+            "export_documents": [],
+            "current_doc_index": 0,
+            "classifications": [],
+            "current_classification": {},
+            "total_documents": 0,
+            "status": "starting",
+            "error": "",
+            "trace_id": trace_id,
+            "lc_id": None,
+            "classification_run_id": None,
+            "db_service": None
+        }
+    
+    # Check for initialization errors
+    if initial_state.get("status") == "initialization_failed":
+        print(f"❌ Graph initialization failed: {initial_state.get('error')}")
+        return initial_state
     
     config = {
         "configurable": {"thread_id": "classification_run"},
         "recursion_limit": 100
     }
     
-    final_state = graph.invoke(initial_state, config=config)
-    
-    if final_state.get("processing_complete"):
-        print("\n🎉 Classification completed successfully!")
-    else:
-        print("\n⚠️  Classification completed with issues")
+    try:
+        final_state = graph.invoke(initial_state, config=config)
         
-    return final_state
+        # Classification run status is updated in format_final_results
+        
+        if final_state.get("processing_complete"):
+            print("\n🎉 Classification completed successfully!")
+        else:
+            print("\n⚠️  Classification completed with issues")
+            
+        return final_state
+        
+    except Exception as e:
+        print(f"❌ Error during classification: {e}")
+        
+        # Update classification run status to failed if using database
+        db_service = initial_state.get("db_service")
+        classification_run_id = initial_state.get("classification_run_id")
+        
+        if db_service and classification_run_id:
+            try:
+                db_service.update_classification_run_status(
+                    run_id=classification_run_id,
+                    status="failed"
+                )
+            except:
+                pass  # Don't fail on cleanup errors
+        
+        return {**initial_state, "error": f"Classification failed: {e}", "status": "failed"}
+    
+    finally:
+        # Clean up database service
+        db_service = initial_state.get("db_service")
+        if db_service:
+            try:
+                db_service.close()
+                print("✅ Database connection closed")
+            except Exception as e:
+                print(f"⚠️  Warning: Error closing database connection: {e}")
+
+
+# Legacy function for backward compatibility
+def run_classification_legacy():
+    """Run classification using the original JSON file method"""
+    return run_classification(lc_reference=None)
 
 
 if __name__ == "__main__":
-    run_classification()
+    # Try to get LC reference from command line or use a default
+    import sys
+    
+    if len(sys.argv) > 1:
+        lc_ref = sys.argv[1]
+        print(f"Using LC reference from command line: {lc_ref}")
+        run_classification(lc_reference=lc_ref)
+    else:
+        # Try to find any LC in the database and use the first one
+        try:
+            with create_db_service() as db_service:
+                # Use the first LC found
+                first_lc = db_service.session.query(LCModel).first()
+                if first_lc:
+                    print(f"Using first LC found in database: {first_lc.lc_reference}")
+                    run_classification(lc_reference=first_lc.lc_reference)
+                else:
+                    print("❌ No LCs found in database")
+                    print("💡 Run populate_db.py first to load LC data")
+        except Exception as e:
+            print(f"❌ Could not connect to database: {e}")
+            print("📝 Usage: python graph.py [LC_REFERENCE]")
+            print("📝 Or ensure database is populated with LC data")

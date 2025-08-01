@@ -1,0 +1,9 @@
+{
+  "dependencies": [
+    "./lc_document_classifier"
+  ],
+  "graphs": {
+    "lc_classifier": "./lc_document_classifier/graph.py:graph"
+  },
+  "env": ".env"
+}

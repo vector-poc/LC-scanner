@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: lc_scanner_postgres
+    environment:
+      POSTGRES_DB: lc_scanner
+      POSTGRES_USER: lc_user
+      POSTGRES_PASSWORD: lc_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lc_user -d lc_scanner"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# Uncomment the following section to start the API with docker-compose
+  # api:
+  #   build: ./api
+  #   container_name: lc_scanner_api
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     DATABASE_URL: "postgresql://lc_user:lc_password@postgres:5432/lc_scanner"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   volumes:
+  #     - ./api:/app
+  #     - ./output:/app/data/output
+  #     - ./documents:/app/data/documents
+  #   command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  postgres_data:
